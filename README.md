@@ -6,13 +6,21 @@ A Selenium-based scraper for [Indian Railways RBS (Rates Branch System)](https:/
 
 Given a pair of station codes, it queries RBS and returns the full list of intermediate stations, cumulative distances, and total route distance — for both the **Shortest Path** and the **Rational Route** (the officially prescribed freight route by commodity).
 
+## How it works
+
+1. Opens Chrome and navigates to the RBS form
+2. Fills in the origin/destination station codes, gauge (Broad), and commodity
+3. Waits for the results table to appear (explicit wait, no fixed sleep)
+4. Parses the station table — RBS renders rows in two formats (code on its own line followed by name+data, or all on one line) and sometimes appends the reverse route; the parser handles both
+5. Saves results to JSON, resuming from where it left off if interrupted
+
 ## Installation
 
 ```bash
-pip install selenium webdriver-manager
+pip install -r requirements.txt
 ```
 
-Chrome must be installed. ChromeDriver is managed automatically.
+Chrome must be installed. ChromeDriver is managed automatically by `webdriver-manager`.
 
 ## Usage
 
@@ -67,8 +75,7 @@ Results are saved to `routes_output.json` (shortest) or `rational_routes_output.
   "total_stations": 26,
   "route": [
     { "station_code": "OCIG", "station_name": "PVT. SDG OF M/S DALMIA CEMENT (BHARAT) LTD.", "cumulative_dist_km": "0.0" },
-    { "station_code": "GP",   "station_name": "Rajgangpur", "cumulative_dist_km": "2.34" },
-    ...
+    { "station_code": "GP",   "station_name": "Rajgangpur", "cumulative_dist_km": "2.34" }
   ]
 }
 ```
@@ -78,3 +85,14 @@ The scraper resumes automatically — already-completed pairs are skipped on re-
 ## Station codes
 
 Station codes are the standard Indian Railways station codes (2–6 uppercase characters), the same ones used in FOIS, NTES, and RBS.
+
+## Limitations
+
+- **Chrome required** — headless mode needs Chrome installed on the host machine
+- **Rate limiting** — the RBS server is a public government portal; keep workers at 3–4 max
+- **Site availability** — RBS may be down during Indian Railways maintenance windows (typically late night IST)
+- **Parsing** — the parser handles the two known RBS row formats; if the site changes its layout, parsing may need updating
+
+## License
+
+MIT
