@@ -30,9 +30,15 @@ python scrape.py rational TSLJ ATLP
 # Headless Chrome
 python scrape.py shortest --headless
 
+# Parallel workers — runs N Chrome instances simultaneously (~Nx faster)
+python scrape.py shortest --headless --workers 3
+python scrape.py rational --headless --workers 4
+
 # Debug mode (dumps form fields + page source)
 python scrape.py rational OCIG PBJT --debug
 ```
+
+> Keep `--workers` at 3–4 max to avoid rate-limiting by the RBS server.
 
 ## Input
 
