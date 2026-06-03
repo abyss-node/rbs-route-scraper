@@ -3,18 +3,21 @@ RBS Rake Route Scraper
 Target: rbs.indianrail.gov.in
 
 Usage:
-  python scrape.py shortest                        # all 43 OD pairs, shortest path
-  python scrape.py rational                        # all 43 OD pairs, rational routes
-  python scrape.py shortest OCIG PBJT             # single test pair
-  python scrape.py rational OCIG PBJT             # single test pair
-  python scrape.py shortest --headless            # headless Chrome
-  python scrape.py rational OCIG PBJT --debug     # form dump + page source
+  python scrape.py shortest                          # all 43 OD pairs, shortest path
+  python scrape.py rational                          # all 43 OD pairs, rational routes
+  python scrape.py shortest OCIG PBJT               # single test pair
+  python scrape.py rational OCIG PBJT               # single test pair
+  python scrape.py shortest --headless              # headless Chrome
+  python scrape.py shortest --headless --workers 4  # 4 parallel Chrome instances
+  python scrape.py rational OCIG PBJT --debug       # form dump + page source
 """
 
 import json
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from selenium import webdriver
@@ -398,14 +401,38 @@ def save(results, output_file):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+def _run_one(pair, mode, headless, debug):
+    """Scrape a single pair in its own Chrome instance. Called from worker threads."""
+    o, d      = pair["origin"], pair["destination"]
+    commodity = COMMODITY_MAP.get(pair.get("commodity", "Unknown"), "ALL")
+    driver    = make_driver(headless)
+    try:
+        if mode == "shortest":
+            page_text, err = scrape_shortest(driver, o, d, debug=debug)
+        else:
+            page_text, err = scrape_rational(driver, o, d, commodity=commodity, debug=debug)
+    finally:
+        driver.quit()
+    return build_result(mode, pair, page_text, err)
+
+
 def main():
     argv     = sys.argv[1:]
     headless = "--headless" in argv
     debug    = "--debug"    in argv
     plain    = [a for a in argv if not a.startswith("--")]
 
+    # --workers N  (default 1)
+    workers = 1
+    for i, a in enumerate(argv):
+        if a == "--workers" and i + 1 < len(argv):
+            try:
+                workers = max(1, int(argv[i + 1]))
+            except ValueError:
+                pass
+
     if not plain or plain[0] not in ("shortest", "rational"):
-        print("Usage: python scrape.py <shortest|rational> [ORIGIN DEST] [--headless] [--debug]")
+        print("Usage: python scrape.py <shortest|rational> [ORIGIN DEST] [--headless] [--workers N] [--debug]")
         sys.exit(1)
 
     mode   = plain[0]
@@ -414,51 +441,67 @@ def main():
         single = {"origin": plain[1], "destination": plain[2],
                   "company": "test", "commodity": "Unknown"}
 
-    pairs = [single] if single else load_pairs()
+    pairs       = [single] if single else load_pairs()
     output_file = OUTPUT_FILES[mode]
     existing, done = ([], set()) if single else load_existing(output_file)
-    results = list(existing)
+
+    todo = [p for p in pairs if (p["origin"], p["destination"]) not in done]
 
     print(f"RBS {'Shortest Path' if mode == 'shortest' else 'Rational Routes'} Scraper")
     print(f"URL: {URLS[mode]}")
-    print(f"Pairs: {len(pairs)} | Done: {len(done)} | Remaining: {len(pairs) - len(done)}")
+    print(f"Pairs: {len(pairs)} | Done: {len(done)} | Remaining: {len(todo)} | Workers: {workers}")
     print(f"Mode: {'headless' if headless else 'visible'} | debug: {debug}\n")
 
-    scrape_fn = scrape_shortest if mode == "shortest" else scrape_rational
-    driver    = make_driver(headless)
+    results   = list(existing)
+    save_lock = threading.Lock()
+    completed = [0]
 
-    try:
-        for i, pair in enumerate(pairs, 1):
-            o, d = pair["origin"], pair["destination"]
-            if (o, d) in done:
-                continue
-
-            commodity = COMMODITY_MAP.get(pair.get("commodity", "Unknown"), "ALL")
-            label     = f"[{i}/{len(pairs)}] {pair.get('company', '')}: {o}->{d}"
-            if mode == "rational":
-                label += f" [{commodity}]"
-            print(f"{label} ... ", end="", flush=True)
-
-            if mode == "shortest":
-                page_text, err = scrape_fn(driver, o, d, debug=debug)
-            else:
-                page_text, err = scrape_fn(driver, o, d, commodity=commodity, debug=debug)
-
-            r = build_result(mode, pair, page_text, err)
+    def on_done(pair, r):
+        o, d = pair["origin"], pair["destination"]
+        commodity = COMMODITY_MAP.get(pair.get("commodity", "Unknown"), "ALL")
+        completed[0] += 1
+        label = f"[{completed[0]}/{len(todo)}] {pair.get('company', '')}: {o}->{d}"
+        if mode == "rational":
+            label += f" [{commodity}]"
+        if r["route"]:
+            status = f"OK {len(r['route'])} stations | {r['distance_km']} km"
+        elif r.get("distance_km") is not None:
+            status = f"~ {r['distance_km']} km (distance only)"
+        else:
+            status = f"FAIL {r['error']}"
+        print(f"{label} ... {status}", flush=True)
+        with save_lock:
             results.append(r)
             save(results, output_file)
 
-            if r["route"]:
-                print(f"OK {len(r['route'])} stations | {r['distance_km']} km")
-            elif r.get("distance_km") is not None:
-                print(f"~ {r['distance_km']} km (distance only)")
-            else:
-                print(f"FAIL {r['error']}")
-
-            time.sleep(0.8)
-
-    finally:
-        driver.quit()
+    if workers == 1:
+        # Single-driver path — reuse one Chrome instance (faster per-pair overhead)
+        driver = make_driver(headless)
+        try:
+            for pair in todo:
+                o, d      = pair["origin"], pair["destination"]
+                commodity = COMMODITY_MAP.get(pair.get("commodity", "Unknown"), "ALL")
+                if mode == "shortest":
+                    page_text, err = scrape_shortest(driver, o, d, debug=debug)
+                else:
+                    page_text, err = scrape_rational(driver, o, d, commodity=commodity, debug=debug)
+                r = build_result(mode, pair, page_text, err)
+                on_done(pair, r)
+                time.sleep(0.8)
+        finally:
+            driver.quit()
+    else:
+        # Multi-driver path — one Chrome per worker thread
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_run_one, pair, mode, headless, debug): pair
+                       for pair in todo}
+            for future in as_completed(futures):
+                pair = futures[future]
+                try:
+                    r = future.result()
+                except Exception as e:
+                    r = build_result(mode, pair, None, f"Worker exception: {e}")
+                on_done(pair, r)
 
     success   = sum(1 for r in results if r.get("route"))
     dist_only = sum(1 for r in results if not r.get("route") and r.get("distance_km") is not None)
